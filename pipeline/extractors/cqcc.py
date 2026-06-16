@@ -1,19 +1,14 @@
-import os
 import sys
-
 import numpy as np
 import librosa
-
 from extractors.base import FeatureExtractor
+from pathlib import Path
 
-# The CQCC implementation is inside the ASVspoof 2021 baseline folder.
-_CQCC_PYTHON_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "2021", "LA", "Baseline-CQCC-GMM", "python",
-)
-sys.path.insert(0, _CQCC_PYTHON_DIR)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_CQCC_PYTHON_DIR = _REPO_ROOT / "2021" / "LA" / "Baseline-CQCC-GMM" / "python"
+sys.path.insert(0, str(_CQCC_PYTHON_DIR))
+
 from CQCC.cqcc import cqcc  # noqa: E402
-
 
 class CQCCExtractor(FeatureExtractor):
     """

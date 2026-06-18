@@ -15,7 +15,7 @@ The CQCC extractor also requires the ASVspoof 2021 baseline folder to be present
 The four scripts must be run in order. Each step produces files consumed by the next one.
 prepare_splits.py  →  extract_features.py  →  evaluate.py  →  analyse.py
 
-    # 2.1 Build split CSVs
+  # 2.1 Build split CSVs
           python scripts/prepare_splits.py [-h] [--dataset-id DATASET_ID]
                                   [--output-dir OUTPUT_DIR]
                                   [--train-ratio TRAIN_RATIO]

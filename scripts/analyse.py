@@ -6,6 +6,7 @@ Single representation: python scripts/analyse.py --representation prosodic
 Multiple representations: python scripts/analyse.py --representation prosodic whisper xlsr
 Save plots to disk: python scripts/analyse.py --representation prosodic whisper --save-plots
 Custom output directory for plots: python scripts/analyse.py --representation prosodic --save-plots --plots-dir results/plots
+Run acoustic error analysis too: python scripts/analyse.py --representation mfcc lfcc cqcc prosodic whisper --save-plots --error-analysis
 """
 
 import argparse
@@ -15,6 +16,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import mannwhitneyu
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
@@ -29,6 +34,11 @@ from sklearn.metrics import (
 DEFAULT_FEATURES_DIR = Path("artifacts/features")
 DEFAULT_META_DIR = Path("artifacts")
 DEFAULT_PLOTS_DIR = Path("results/plots")
+
+TARGET_SR = 16_000
+DATASET_ID = "AKCIT-Deepfake/BRSpeech-DF"
+ACOUSTIC_FEAT_COLS = ["duration_s", "silence_ratio", "spectral_flat",
+                      "voiced_ratio", "f0_mean"]
 
 
 def compute_eer(y_true, scores):
@@ -222,6 +232,266 @@ def print_error_summary(reps, y_test, preds_dict, models):
         print(all_wrong["y_true"].value_counts().rename({0: "bonafide", 1: "spoof"}).to_string())
 
 
+
+# ---------------------------------------------------------------------------
+# Error analysis: acoustic profiling of misclassified samples
+# (ported from the experiments notebook)
+# ---------------------------------------------------------------------------
+def extract_acoustic_profile(audio, sr):
+    """Per-utterance acoustic descriptors used to characterise hard samples."""
+    import librosa
+    from amfm_decompy import pYAAPT, basic_tools
+
+    if sr != TARGET_SR:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
+        sr = TARGET_SR
+    if len(audio) < 400:
+        audio = np.pad(audio, (0, 400 - len(audio)))
+
+    duration_s = len(audio) / sr
+
+    rms = librosa.feature.rms(y=audio, frame_length=400, hop_length=160)[0]
+    silence_thresh = 0.01 * rms.max() if rms.max() > 0 else 0.0
+    silence_ratio = float((rms < silence_thresh).mean())
+
+    flat = librosa.feature.spectral_flatness(y=audio, hop_length=160)[0]
+    spectral_flat = float(flat.mean())
+
+    try:
+        signal = basic_tools.SignalObj(audio, sr)
+        pitch = pYAAPT.yaapt(signal, frame_length=25.0, frame_space=10.0)
+        f0_frames = pitch.samp_values
+        voiced_mask = f0_frames > 0
+        voiced_ratio = float(voiced_mask.mean()) if len(f0_frames) > 0 else 0.0
+        f0_mean = float(f0_frames[voiced_mask].mean()) if voiced_mask.any() else 0.0
+    except (IndexError, ValueError):
+        voiced_ratio, f0_mean = 0.0, 0.0
+
+    return dict(duration_s=duration_s, silence_ratio=silence_ratio,
+                spectral_flat=spectral_flat, voiced_ratio=voiced_ratio,
+                f0_mean=f0_mean)
+
+
+def load_acoustic_profiles(features_dir, meta_dir, y_test):
+    """Load cached acoustic profiles, or stream the test audio once to build them."""
+    cache = features_dir / "test" / "acoustic_profiles.npy"
+    if cache.exists():
+        print("Loading cached acoustic profiles ...")
+        profiles = list(np.load(cache, allow_pickle=True))
+    else:
+        from tqdm import tqdm
+        from loader import SplitLoader
+
+        loader = SplitLoader(dataset_id=DATASET_ID, splits_dir=str(meta_dir))
+        profiles = []
+        n_test = loader.stats("test")["total"]
+        for audio, sr, label, meta in tqdm(loader.stream("test"),
+                                           total=n_test, desc="Acoustic profiling"):
+            profiles.append(extract_acoustic_profile(audio, sr))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache, profiles)
+        print(f"Saved {len(profiles)} profiles -> {cache}")
+
+    acoustic_df = pd.DataFrame(profiles)
+    acoustic_df["y_true"] = y_test
+    return acoustic_df
+
+
+def compute_correctness(reps, y_test, preds_dict):
+    """Per-rep correctness masks + the 'universally hard' mask (wrong by ALL reps)."""
+    correct = {rep: (preds_dict[rep] == y_test) for rep in reps}
+    universally_hard = np.ones(len(y_test), dtype=bool)
+    for rep in reps:
+        universally_hard &= ~correct[rep]
+
+    print(f"Test set size      : {len(y_test):,}")
+    for rep in reps:
+        n_wrong = int((~correct[rep]).sum())
+        print(f"  {rep:<12}  errors = {n_wrong:,}  ({100 * n_wrong / len(y_test):.1f}%)")
+    print(f"  {'universally hard':<12}  = {int(universally_hard.sum()):,}  "
+          f"({100 * universally_hard.mean():.1f}% -- wrong by ALL reps)")
+    return correct, universally_hard
+
+
+def run_mwu(acoustic_df, mask_error, mask_correct, label, feat_cols):
+    """Mann-Whitney U comparing correct vs error groups for one error definition."""
+    rows = []
+    for feat in feat_cols:
+        vals_c = acoustic_df.loc[mask_correct, feat].values
+        vals_e = acoustic_df.loc[mask_error, feat].values
+        if len(vals_e) < 5:
+            continue
+        _, p = mannwhitneyu(vals_c, vals_e, alternative="two-sided")
+        sig = "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else ""))
+        rows.append(dict(group=label, feature=feat,
+                         median_correct=float(np.median(vals_c)),
+                         median_error=float(np.median(vals_e)),
+                         p_value=float(p), sig=sig))
+        print(f"  {feat:<16}  correct={np.median(vals_c):.4f}  "
+              f"error={np.median(vals_e):.4f}  p={p:.3e}  {sig}")
+    return rows
+
+
+def statistical_comparison(reps, acoustic_df, correct, universally_hard, feat_cols):
+    """Run MWU for (A) per-representation errors and (B) universally hard samples."""
+    all_results = []
+    print("-- A) Per-representation errors ----------------------------------------")
+    for rep in reps:
+        print(f"\n  [{rep}]")
+        all_results.extend(
+            run_mwu(acoustic_df, ~correct[rep], correct[rep], rep, feat_cols)
+        )
+    print("\n-- B) Universally hard (wrong by ALL reps) vs. rest --------------------")
+    all_results.extend(
+        run_mwu(acoustic_df, universally_hard, ~universally_hard,
+                "universally_hard", feat_cols)
+    )
+    return pd.DataFrame(all_results)
+
+
+def _plot_distributions(acoustic_df, mask_error, mask_correct, title,
+                        ax_row, results_sub, feat_cols):
+    for i, feat in enumerate(feat_cols):
+        ax = ax_row[i]
+        vals_c = acoustic_df.loc[mask_correct, feat].values
+        vals_e = acoustic_df.loc[mask_error, feat].values
+        lo = np.percentile(np.concatenate([vals_c, vals_e]), 1)
+        hi = np.percentile(np.concatenate([vals_c, vals_e]), 99)
+        vals_c = np.clip(vals_c, lo, hi)
+        vals_e = np.clip(vals_e, lo, hi)
+        ax.hist(vals_c, bins=35, alpha=0.55, color="steelblue", density=True,
+                label=f"correct (n={len(vals_c):,})")
+        ax.hist(vals_e, bins=35, alpha=0.55, color="tomato", density=True,
+                label=f"error (n={len(vals_e):,})")
+        row = results_sub[results_sub.feature == feat]
+        p_str = f"p={row.p_value.values[0]:.2e} {row.sig.values[0]}" if len(row) else ""
+        ax.set_title(f"{title}\n{feat}\n{p_str}", fontsize=8)
+        if i == 0:
+            ax.legend(fontsize=7)
+
+
+def plot_error_distributions(reps, acoustic_df, correct, universally_hard,
+                             results_df, feat_cols, plots_dir, save):
+    n_reps = len(reps)
+    n_feats = len(feat_cols)
+
+    # Part A: per-representation grid (feature rows x representation columns)
+    fig_a, axes_a = plt.subplots(n_feats, n_reps,
+                                 figsize=(3.8 * n_reps, 3.2 * n_feats),
+                                 squeeze=False)
+    for j, rep in enumerate(reps):
+        rsub = results_df[results_df.group == rep]
+        _plot_distributions(acoustic_df, ~correct[rep], correct[rep],
+                            rep, axes_a[:, j], rsub, feat_cols)
+    fig_a.suptitle("A) Per-representation: correct vs. misclassified",
+                   y=1.01, fontsize=11)
+    plt.tight_layout()
+    savefig(fig_a, plots_dir, "error_dist_per_rep.png", save)
+
+    # Part B: universally hard vs. rest (one column per feature)
+    fig_b, axes_b = plt.subplots(1, n_feats, figsize=(3.8 * n_feats, 3.5),
+                                 squeeze=False)
+    rsub_b = results_df[results_df.group == "universally_hard"]
+    _plot_distributions(acoustic_df, universally_hard, ~universally_hard,
+                        "universally hard", axes_b[0], rsub_b, feat_cols)
+    fig_b.suptitle("B) Universally hard (wrong by ALL reps) vs. rest", fontsize=11)
+    plt.tight_layout()
+    savefig(fig_b, plots_dir, "error_dist_universal.png", save)
+
+
+def fit_misclassification_lr(X_acoustic, y_hard, label, feat_cols):
+    """5-fold CV logistic regression predicting misclassification from acoustics."""
+    if y_hard.sum() < 10:
+        print(f"  {label:<20}  too few errors ({int(y_hard.sum())}) -- skipping")
+        return None
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    aucs = []
+    sc = StandardScaler()
+    for tr, va in cv.split(X_acoustic, y_hard):
+        clf = LogisticRegression(max_iter=500, C=1.0)
+        clf.fit(sc.fit_transform(X_acoustic[tr]), y_hard[tr])
+        aucs.append(roc_auc_score(
+            y_hard[va], clf.predict_proba(sc.transform(X_acoustic[va]))[:, 1]))
+    clf_full = LogisticRegression(max_iter=500, C=1.0)
+    clf_full.fit(StandardScaler().fit_transform(X_acoustic), y_hard)
+    coefs = dict(zip(feat_cols, clf_full.coef_[0]))
+    top = max(coefs, key=lambda k: abs(coefs[k]))
+    direction = "harder" if coefs[top] > 0 else "easier"
+    print(f"  {label:<22}  AUC={np.mean(aucs):.3f}+/-{np.std(aucs):.3f}"
+          f"  top={top} ({direction}, {coefs[top]:+.3f})")
+    return {"group": label, **coefs,
+            "auc_mean": float(np.mean(aucs)), "auc_std": float(np.std(aucs))}
+
+
+def plot_lr_coefficients(reps, acoustic_df, correct, universally_hard,
+                         feat_cols, plots_dir, save):
+    X_acoustic = acoustic_df[feat_cols].values.astype(np.float32)
+    np.nan_to_num(X_acoustic, copy=False)
+
+    print("-- A) Per-representation -----------------------------------------------")
+    lr_records = []
+    for rep in reps:
+        rec = fit_misclassification_lr(X_acoustic, (~correct[rep]).astype(int),
+                                       rep, feat_cols)
+        if rec:
+            lr_records.append(rec)
+
+    print("\n-- B) Universally hard -------------------------------------------------")
+    rec = fit_misclassification_lr(X_acoustic, universally_hard.astype(int),
+                                   "universally_hard", feat_cols)
+    if rec:
+        lr_records.append(rec)
+
+    if not lr_records:
+        print("No LR records to plot -- skipping coefficient heatmap.")
+        return
+
+    lr_df = pd.DataFrame(lr_records).set_index("group")
+    coef_vals = lr_df[feat_cols].values
+    vmax = np.abs(coef_vals).max()
+
+    fig, ax = plt.subplots(figsize=(len(feat_cols) * 1.5, len(lr_df) * 0.85 + 1.2))
+    im = ax.imshow(coef_vals, cmap="RdBu_r", aspect="auto", vmin=-vmax, vmax=vmax)
+    ax.set_xticks(range(len(feat_cols)))
+    ax.set_xticklabels(feat_cols, rotation=30, ha="right", fontsize=9)
+    ax.set_yticks(range(len(lr_df)))
+    ax.set_yticklabels(lr_df.index, fontsize=9)
+    plt.colorbar(im, ax=ax, label="LR coefficient  (red = harder, blue = easier)")
+
+    for i, (grp, row) in enumerate(lr_df.iterrows()):
+        for j, feat in enumerate(feat_cols):
+            ax.text(j, i, f"{row[feat]:.2f}", ha="center", va="center", fontsize=8)
+        ax.text(-0.6, i, f"AUC={row['auc_mean']:.3f}", ha="right", va="center",
+                fontsize=8, color="dimgray")
+
+    ax.set_title("LR coefficients: acoustic predictors of misclassification\n"
+                 "(universally_hard = wrong by ALL reps)", fontsize=10)
+    plt.tight_layout()
+    savefig(fig, plots_dir, "error_lr_coefs.png", save)
+
+
+def run_error_analysis(reps, y_test, preds_dict, features_dir, meta_dir,
+                       plots_dir, save):
+    print("\n=== Error analysis ===")
+    correct, universally_hard = compute_correctness(reps, y_test, preds_dict)
+
+    acoustic_df = load_acoustic_profiles(features_dir, meta_dir, y_test)
+    print("\nAcoustic profile summary:")
+    print(acoustic_df.describe().round(4).to_string())
+
+    print("\nStatistical comparison (Mann-Whitney U):")
+    results_df = statistical_comparison(reps, acoustic_df, correct,
+                                        universally_hard, ACOUSTIC_FEAT_COLS)
+
+    print("\nGenerating error-distribution plots")
+    plot_error_distributions(reps, acoustic_df, correct, universally_hard,
+                             results_df, ACOUSTIC_FEAT_COLS, plots_dir, save)
+
+    print("\nFitting misclassification LR")
+    plot_lr_coefficients(reps, acoustic_df, correct, universally_hard,
+                         ACOUSTIC_FEAT_COLS, plots_dir, save)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyse saved predictions and generate plots.")
     parser.add_argument(
@@ -258,6 +528,12 @@ def main():
         "--skip-pca",
         action="store_true",
         help="Skip PCA plots (slow for large/high-dimensional features)",
+    )
+    parser.add_argument(
+        "--error-analysis",
+        action="store_true",
+        help="Run acoustic error analysis (streams test audio once if not cached): "
+             "MWU tests, distribution plots, misclassification-LR coefficient heatmap",
     )
     args = parser.parse_args()
 
@@ -302,6 +578,10 @@ def main():
         X_test_dict = {rep: load_test_features(args.features_dir, rep) for rep in reps}
         plot_pca_by_label(reps, y_test, X_test_dict, args.plots_dir, args.save_plots)
         plot_pca_by_model(reps, y_test, X_test_dict, models, args.plots_dir, args.save_plots)
+
+    if args.error_analysis:
+        run_error_analysis(reps, y_test, preds_dict, args.features_dir,
+                           args.meta_dir, args.plots_dir, args.save_plots)
 
 
 if __name__ == "__main__":

@@ -15,13 +15,14 @@ matplotlib = "*"
 librosa = "*"
 pytorch = {version = "*", channel = "pytorch"}
 transformers = "*"
-datasets = "*"
+datasets = "<4.0"
 tqdm = "*"
 
 [pypi-dependencies]
 torchaudio = "*"
 python-speech-features = "*"
 amfm-decompy = "*"
+soundfile = "*"
 
 [tasks]
 extract = "python extract_features.py"

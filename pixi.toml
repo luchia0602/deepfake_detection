@@ -1,0 +1,29 @@
+[workspace]
+name = "deepfake-detection"
+version = "0.1.0"
+description = "Benchmarking audio deepfake detection features on Portuguese speech"
+channels = ["pytorch", "conda-forge"]
+platforms = ["win-64", "linux-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.10,<3.13"
+numpy = "*"
+pandas = "*"
+scipy = "*"
+scikit-learn = "*"
+matplotlib = "*"
+librosa = "*"
+pytorch = {version = "*", channel = "pytorch"}
+transformers = "*"
+datasets = "*"
+tqdm = "*"
+
+[pypi-dependencies]
+torchaudio = "*"
+python-speech-features = "*"
+amfm-decompy = "*"
+
+[tasks]
+extract = "python extract_features.py"
+evaluate = "python evaluate.py"
+analyse = "python analyse.py"

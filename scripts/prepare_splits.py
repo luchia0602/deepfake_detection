@@ -1,27 +1,34 @@
 """
-Stream metadata from a HuggingFace dataset, build balanced train/val/test splits (equal bonafide/spoof counts, spoof diversity-aware sampling), and write one CSV per split
+Stream metadata from the BRSpeech-DF HuggingFace dataset and build balanced,
+speaker-disjoint train/val/test split CSVs.
 
-Usage: python scripts/prepare_splits.py
-Custom paths / ratios
-python scripts/prepare_splits.py \
-    --dataset-id AKCIT-Deepfake/BRSpeech-DF \
-    --output-dir artifacts \
-    --train-ratio 0.8 \
-    --val-ratio 0.1 \
-    --seed 42
+For each original HuggingFace split (train / validation / test) we keep every
+bonafide example (the scarce class) and sample an equal number of spoof examples,
+distributed across TTS models proportionally so no single model dominates. Because
+balancing happens *within* each original split, the resulting train/val/test sets
+inherit the dataset's original speaker-disjoint partition: no speaker appears in
+more than one split.
+
+Usage:
+    python scripts/prepare_splits.py
+    python scripts/prepare_splits.py --output-dir artifacts
 """
 
 import argparse
 import collections
 import csv
 import math
-import os
 import random
 from pathlib import Path
 from datasets import load_dataset
 from tqdm import tqdm
 
+# --- fixed configuration (never changes for this project) ------------------
+DATASET_ID = "AKCIT-Deepfake/BRSpeech-DF"
+SEED = 42
+
 FIELDNAMES = ["split", "hf_index", "hf_split", "hf_config", "label", "model"]
+HF_TO_NEW = {"train": "train", "validation": "val", "test": "test"}
 
 
 def collect_bonafide(dataset_id: str) -> list[dict]:
@@ -55,7 +62,13 @@ def collect_spoof(dataset_id: str) -> list[dict]:
             })
     return records
 
+
 def proportional_sample(records: list[dict], budget: int, rng: random.Random) -> list[dict]:
+    """
+    Sample `budget` records, distributing slots across TTS models proportionally
+    to each model's count. If a model has fewer examples than its quota, all are
+    taken and leftover slots are redistributed to the remaining pool.
+    """
     by_model: dict[str, list[dict]] = collections.defaultdict(list)
     for r in records:
         by_model[r["model"]].append(r)
@@ -89,47 +102,40 @@ def proportional_sample(records: list[dict], budget: int, rng: random.Random) ->
 
     return sampled
 
-def make_balanced_splits(
+
+def build_balanced_splits(
     bonafide: list[dict],
     spoof: list[dict],
-    train_ratio: float,
-    val_ratio: float,
     seed: int,
-) -> tuple[list[dict], list[dict], list[dict]]:
-
+) -> dict[str, list[dict]]:
+    """
+    Within each original HuggingFace split, keep all bonafide and sample an equal,
+    model-diverse set of spoof. Returns {"train": [...], "val": [...], "test": [...]}.
+    """
     rng = random.Random(seed)
-    rng.shuffle(bonafide)
-    n = len(bonafide)
-    n_train = int(n * train_ratio)
-    n_val   = int(n * val_ratio)
 
-    bf_train = bonafide[:n_train]
-    bf_val   = bonafide[n_train: n_train + n_val]
-    bf_test  = bonafide[n_train + n_val:]
+    bona_by_split: dict[str, list[dict]] = collections.defaultdict(list)
+    spoof_by_split: dict[str, list[dict]] = collections.defaultdict(list)
+    for r in bonafide:
+        bona_by_split[r["hf_split"]].append(r)
+    for r in spoof:
+        spoof_by_split[r["hf_split"]].append(r)
 
-    print(f"Bonafide train: {len(bf_train):,}  val: {len(bf_val):,}  test: {len(bf_test):,}")
+    out: dict[str, list[dict]] = {}
+    for hf_split in ("train", "validation", "test"):
+        bf = bona_by_split[hf_split]
+        sp = proportional_sample(spoof_by_split[hf_split], len(bf), rng)
+        tag = HF_TO_NEW[hf_split]
 
-    rng.shuffle(spoof)
-    sp_train = proportional_sample(spoof, len(bf_train), rng)
-
-    sp_train_ids = {id(r) for r in sp_train}
-    remaining = [r for r in spoof if id(r) not in sp_train_ids]
-    sp_val = proportional_sample(remaining, len(bf_val), rng)
-
-    sp_val_ids = {id(r) for r in sp_val}
-    remaining2 = [r for r in remaining if id(r) not in sp_val_ids]
-    sp_test = proportional_sample(remaining2, len(bf_test), rng)
-
-    print(f"Spoof train: {len(sp_train):,}  val: {len(sp_val):,}  test: {len(sp_test):,}")
-
-    def combine(bf, sp, tag):
         combined = bf + sp
         for r in combined:
             r["split"] = tag
         rng.shuffle(combined)
-        return combined
+        out[tag] = combined
 
-    return combine(bf_train, sp_train, "train"), combine(bf_val, sp_val, "val"), combine(bf_test, sp_test, "test")
+        print(f"  {tag:5s}: bonafide {len(bf):,} + spoof {len(sp):,} = {len(combined):,}")
+    return out
+
 
 def write_csv(records: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,14 +160,10 @@ def print_model_report(train: list[dict], val: list[dict], test: list[dict]) -> 
         s = sum(1 for r in test  if r["model"] == model)
         print(f"  {model:<23} {t:>8,} {v:>8,} {s:>8,}")
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Build balanced train/val/test split CSVs from a HuggingFace dataset."
-    )
-    parser.add_argument(
-        "--dataset-id",
-        default="AKCIT-Deepfake/BRSpeech-DF",
-        help="HuggingFace dataset repo ID (default: AKCIT-Deepfake/BRSpeech-DF)",
+        description="Build balanced, speaker-disjoint train/val/test split CSVs."
     )
     parser.add_argument(
         "--output-dir",
@@ -169,30 +171,23 @@ def main():
         default=Path("artifacts"),
         help="Directory to write train.csv / val.csv / test.csv (default: artifacts/)",
     )
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio",   type=float, default=0.1)
-    parser.add_argument("--seed",        type=int,   default=42)
     args = parser.parse_args()
 
     print("Collecting bonafide metadata...")
-    bonafide = collect_bonafide(args.dataset_id)
+    bonafide = collect_bonafide(DATASET_ID)
     print(f"      {len(bonafide):,} bonafide examples")
 
     print("Collecting spoof metadata...")
-    spoof = collect_spoof(args.dataset_id)
+    spoof = collect_spoof(DATASET_ID)
     print(f"      {len(spoof):,} spoof examples")
 
-    print("Building balanced splits...")
-    train_set, val_set, test_set = make_balanced_splits(
-        bonafide, spoof,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-    )
-    write_csv(train_set, args.output_dir / "train.csv")
-    write_csv(val_set,   args.output_dir / "val.csv")
-    write_csv(test_set,  args.output_dir / "test.csv")
-    print_model_report(train_set, val_set, test_set)
+    print("Building balanced, speaker-disjoint splits...")
+    splits = build_balanced_splits(bonafide, spoof, seed=SEED)
+
+    write_csv(splits["train"], args.output_dir / "train.csv")
+    write_csv(splits["val"],   args.output_dir / "val.csv")
+    write_csv(splits["test"],  args.output_dir / "test.csv")
+    print_model_report(splits["train"], splits["val"], splits["test"])
     print("Done.")
 
 

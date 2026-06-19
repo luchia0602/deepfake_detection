@@ -1,13 +1,12 @@
 """
 Stream metadata from the BRSpeech-DF HuggingFace dataset and build balanced,
-speaker-disjoint train/val/test split CSVs.
+speaker-disjoint splits. Bonafide and spoof are balanced within each original
+HuggingFace split (train / validation / test); the validation and test splits
+are then merged into a single test set, so the script writes train.csv and test.csv.
 
-For each original HuggingFace split (train / validation / test) we keep every
-bonafide example (the scarce class) and sample an equal number of spoof examples,
-distributed across TTS models proportionally so no single model dominates. Because
-balancing happens *within* each original split, the resulting train/val/test sets
-inherit the dataset's original speaker-disjoint partition: no speaker appears in
-more than one split.
+Because balancing happens within each original split, the resulting sets inherit
+the dataset's original speaker-disjoint partition: no speaker appears in both
+train and test.
 
 Usage:
     python scripts/prepare_splits.py
@@ -137,6 +136,23 @@ def build_balanced_splits(
     return out
 
 
+def merge_val_into_test(splits: dict[str, list[dict]], seed: int) -> dict[str, list[dict]]:
+    """
+    Combine the validation and test splits into a single test set, leaving train
+    unchanged. The original splits are speaker-disjoint from train, so the merged
+    test set remains speaker-disjoint from train.
+    """
+    rng = random.Random(seed)
+    test = splits["val"] + splits["test"]
+    for r in test:
+        r["split"] = "test"
+    rng.shuffle(test)
+
+    merged = {"train": splits["train"], "test": test}
+    print(f"  merged val + test -> test: {len(test):,}  (train: {len(splits['train']):,})")
+    return merged
+
+
 def write_csv(records: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -146,30 +162,31 @@ def write_csv(records: list[dict], path: Path) -> None:
     print(f"  saved {path}  ({len(records):,} rows)")
 
 
-def print_model_report(train: list[dict], val: list[dict], test: list[dict]) -> None:
+def print_model_report(splits: dict[str, list[dict]]) -> None:
+    names = list(splits.keys())
     all_models = sorted(
-        {r["model"] for split in (train, val, test) for r in split if r["label"] == 1}
+        {r["model"] for recs in splits.values() for r in recs if r["label"] == 1}
     )
-    header = f"{'model':<25} {'train':>8} {'val':>8} {'test':>8}"
+    header = f"{'model':<25} " + " ".join(f"{n:>8}" for n in names)
     print("TTS model distribution in spoof examples")
     print(header)
     print("-" * len(header))
     for model in all_models:
-        t = sum(1 for r in train if r["model"] == model)
-        v = sum(1 for r in val   if r["model"] == model)
-        s = sum(1 for r in test  if r["model"] == model)
-        print(f"  {model:<23} {t:>8,} {v:>8,} {s:>8,}")
+        counts = " ".join(
+            f"{sum(1 for r in splits[n] if r['model'] == model):>8,}" for n in names
+        )
+        print(f"  {model:<23} {counts}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build balanced, speaker-disjoint train/val/test split CSVs."
+        description="Build balanced, speaker-disjoint train/test split CSVs (val merged into test)."
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("artifacts"),
-        help="Directory to write train.csv / val.csv / test.csv (default: artifacts/)",
+        help="Directory to write train.csv / test.csv (default: artifacts/)",
     )
     args = parser.parse_args()
 
@@ -184,10 +201,12 @@ def main():
     print("Building balanced, speaker-disjoint splits...")
     splits = build_balanced_splits(bonafide, spoof, seed=SEED)
 
+    print("Merging validation into test...")
+    splits = merge_val_into_test(splits, seed=SEED)
+
     write_csv(splits["train"], args.output_dir / "train.csv")
-    write_csv(splits["val"],   args.output_dir / "val.csv")
     write_csv(splits["test"],  args.output_dir / "test.csv")
-    print_model_report(splits["train"], splits["val"], splits["test"])
+    print_model_report(splits)
     print("Done.")
 
 

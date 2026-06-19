@@ -1,6 +1,6 @@
 """
 Train a logistic-regression classifier on pre-extracted features and report
-test-set metrics.  
+test-set metrics.
 
 Usage:
 Single representation: python scripts/evaluate.py --representation prosodic
@@ -25,7 +25,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 
 DEFAULT_FEATURES_DIR = Path("artifacts/features")
-DEFAULT_META_DIR = Path("artifacts")
+
 
 def load_split(features_dir: Path, split: str, feat_file: str):
     X = np.load(features_dir / split / feat_file).astype(np.float32)
@@ -41,7 +41,7 @@ def compute_eer(y_true, scores):
     return float((fpr[idx] + fnr[idx]) / 2)
 
 
-def evaluate_one(rep: str, features_dir: Path, meta_dir: Path, force: bool):
+def evaluate_one(rep: str, features_dir: Path, force: bool):
     feat_file = f"X_{rep}.npy"
     out_dir = features_dir / "predictions" / rep
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -57,12 +57,10 @@ def evaluate_one(rep: str, features_dir: Path, meta_dir: Path, force: bool):
         return
 
     X_tr, y_tr = load_split(features_dir, "train", feat_file)
-    X_va, y_va = load_split(features_dir, "val",   feat_file)
     X_te, y_te = load_split(features_dir, "test",  feat_file)
 
     scaler = StandardScaler()
     X_tr = scaler.fit_transform(X_tr)
-    X_va = scaler.transform(X_va)
     X_te = scaler.transform(X_te)
 
     clf = LogisticRegression(max_iter=1000, solver="lbfgs", C=1.0, verbose=1)
@@ -94,6 +92,7 @@ def evaluate_one(rep: str, features_dir: Path, meta_dir: Path, force: bool):
     metrics_path.write_text(json.dumps(metrics, indent=2))
     print(f"[{rep}] saved predictions → {out_dir}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Train LR classifier and evaluate on test set.")
     parser.add_argument(
@@ -110,12 +109,6 @@ def main():
         help=f"Root directory of extracted features (default: {DEFAULT_FEATURES_DIR})",
     )
     parser.add_argument(
-        "--meta-dir",
-        type=Path,
-        default=DEFAULT_META_DIR,
-        help=f"Directory containing train/val/test CSV metadata (default: {DEFAULT_META_DIR})",
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing predictions",
@@ -123,7 +116,7 @@ def main():
     args = parser.parse_args()
 
     for rep in args.representation:
-        evaluate_one(rep, args.features_dir, args.meta_dir, args.force)
+        evaluate_one(rep, args.features_dir, args.force)
 
     if len(args.representation) > 1:
         rows = []

@@ -1,5 +1,7 @@
 """
-Load saved predictions (produced by evaluate.py) and generate analysis plots: ROC curves, Confusion matrices, Per-model accuracy bar chart, Error analysis summary, PCA scatter plots.
+Load saved predictions (produced by evaluate.py) and generate analysis plots:
+ROC curves, confusion matrices, per-model error heatmap, PCA scatter plots, and
+(optionally) an acoustic error analysis.
 
 Usage:
 Single representation: python scripts/analyse.py --representation prosodic
@@ -10,8 +12,8 @@ Run acoustic error analysis too: python scripts/analyse.py --representation mfcc
 """
 
 import argparse
+import math
 from pathlib import Path
-import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -41,6 +43,13 @@ ACOUSTIC_FEAT_COLS = ["duration_s", "silence_ratio", "spectral_flat",
                       "voiced_ratio", "f0_mean"]
 
 
+def grid_shape(n, max_cols=3):
+    """Rows x cols for n panels, capped at max_cols columns (multi-row layout)."""
+    cols = min(max_cols, n)
+    rows = math.ceil(n / cols)
+    return rows, cols
+
+
 def compute_eer(y_true, scores):
     fpr, tpr, _ = roc_curve(y_true, scores, pos_label=1)
     fnr = 1 - tpr
@@ -62,14 +71,19 @@ def load_test_features(features_dir: Path, rep: str):
 
 
 def savefig(fig, plots_dir: Path, name: str, save: bool):
+    """Save a figure. `name` includes its extension (.pdf or .png)."""
     if save:
         plots_dir.mkdir(parents=True, exist_ok=True)
         path = plots_dir / name
-        fig.savefig(path, dpi=150, bbox_inches="tight")
+        if name.lower().endswith(".pdf"):
+            fig.savefig(path, bbox_inches="tight")
+        else:
+            fig.savefig(path, dpi=200, bbox_inches="tight")
         print(f"  saved → {path}")
     else:
         plt.show()
     plt.close(fig)
+
 
 def plot_roc(reps, y_test, probs_dict, plots_dir, save):
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -83,14 +97,15 @@ def plot_roc(reps, y_test, probs_dict, plots_dir, save):
     ax.set_title("ROC curves")
     ax.legend()
     plt.tight_layout()
-    savefig(fig, plots_dir, "roc_curves.png", save)
+    savefig(fig, plots_dir, "roc_curves.pdf", save)
 
 
 def plot_confusion_matrices(reps, y_test, preds_dict, plots_dir, save):
     n = len(reps)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), squeeze=False)
-    axes = axes.ravel()
-    for ax, rep in zip(axes, reps):
+    rows, cols = grid_shape(n, max_cols=3)
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+    axes_flat = axes.ravel()
+    for ax, rep in zip(axes_flat, reps):
         cm = confusion_matrix(y_test, preds_dict[rep])
         disp = ConfusionMatrixDisplay(cm, display_labels=["bonafide", "spoof"])
         disp.plot(ax=ax, colorbar=False, cmap="Blues")
@@ -106,37 +121,12 @@ def plot_confusion_matrices(reps, y_test, preds_dict, plots_dir, save):
             f"Acc={accuracy_score(y_test, preds_dict[rep]):.3f}  "
             f"F1={f1_score(y_test, preds_dict[rep]):.3f}"
         )
-    plt.suptitle("Confusion matrices — test set", y=1.02)
+    # hide any unused panels
+    for ax in axes_flat[n:]:
+        ax.axis("off")
+    plt.suptitle("Confusion matrices — test set", y=1.0)
     plt.tight_layout()
-    savefig(fig, plots_dir, "confusion_matrices.png", save)
-
-
-def plot_per_model_accuracy(reps, y_test, preds_dict, models, plots_dir, save):
-    model_names = sorted(set(models))
-    rows = []
-    for model_name in model_names:
-        mask = models == model_name
-        y_m = y_test[mask]
-        for rep in reps:
-            pred_m = preds_dict[rep][mask]
-            rows.append({
-                "Model":    model_name,
-                "Feature":  rep,
-                "N":        int(mask.sum()),
-                "Accuracy": accuracy_score(y_m, pred_m),
-                "F1":       f1_score(y_m, pred_m, zero_division=0),
-            })
-    df_model = pd.DataFrame(rows)
-    df_pivot = df_model.pivot(index="Model", columns="Feature", values="Accuracy")
-    ax = df_pivot.plot(kind="bar", figsize=(9, 4), width=0.7)
-    ax.axhline(0.5, color="red", linestyle="--", linewidth=0.8, label="chance")
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Per-model accuracy by feature representation")
-    ax.set_xlabel("")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    savefig(ax.get_figure(), plots_dir, "per_model_accuracy.png", save)
+    savefig(fig, plots_dir, "confusion_matrices.pdf", save)
 
 
 def plot_error_heatmap(reps, y_test, preds_dict, models, plots_dir, save):
@@ -158,16 +148,17 @@ def plot_error_heatmap(reps, y_test, preds_dict, models, plots_dir, save):
         for j in range(len(reps)):
             ax.text(j, i, f"{error_matrix[i, j]:.2f}", ha="center", va="center", fontsize=9)
     plt.tight_layout()
-    savefig(fig, plots_dir, "error_heatmap.png", save)
+    savefig(fig, plots_dir, "error_heatmap.pdf", save)
 
 
 def plot_pca_by_label(reps, y_test, X_test_dict, plots_dir, save, n_plot=2000):
     rng = np.random.default_rng(42)
     idx = rng.choice(len(y_test), size=min(n_plot, len(y_test)), replace=False)
     n = len(reps)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), squeeze=False)
-    axes = axes.ravel()
-    for ax, rep in zip(axes, reps):
+    rows, cols = grid_shape(n, max_cols=3)
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+    axes_flat = axes.ravel()
+    for ax, rep in zip(axes_flat, reps):
         X_sub = X_test_dict[rep][idx]
         y_sub = y_test[idx]
         pca = PCA(n_components=2)
@@ -175,38 +166,18 @@ def plot_pca_by_label(reps, y_test, X_test_dict, plots_dir, save, n_plot=2000):
         var = pca.explained_variance_ratio_
         for label, name, color in [(0, "bonafide", "steelblue"), (1, "spoof", "tomato")]:
             mask = y_sub == label
-            ax.scatter(X_2d[mask, 0], X_2d[mask, 1], c=color, label=name, alpha=0.3, s=8, linewidths=0)
+            ax.scatter(X_2d[mask, 0], X_2d[mask, 1], c=color, label=name,
+                       alpha=0.3, s=8, linewidths=0)
         ax.set_title(f"{rep}\n(PC1={var[0]:.1%}, PC2={var[1]:.1%})")
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.legend(markerscale=2)
-    plt.suptitle("PCA of test set features — bonafide vs spoof", y=1.02)
+    for ax in axes_flat[n:]:
+        ax.axis("off")
+    plt.suptitle("PCA of test set features — bonafide vs spoof", y=1.0)
     plt.tight_layout()
+    # PNG: this plot has many thousands of scatter points; a vector PDF would be heavy
     savefig(fig, plots_dir, "pca_by_label.png", save)
-
-
-def plot_pca_by_model(reps, y_test, X_test_dict, models, plots_dir, save, n_plot=2000):
-    rng = np.random.default_rng(42)
-    idx = rng.choice(len(y_test), size=min(n_plot, len(y_test)), replace=False)
-    model_list = sorted(set(models))
-    colors = cm.tab10(np.linspace(0, 1, len(model_list)))
-    n = len(reps)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), squeeze=False)
-    axes = axes.ravel()
-    for ax, rep in zip(axes, reps):
-        X_sub = X_test_dict[rep][idx]
-        m_sub = models[idx]
-        pca = PCA(n_components=2)
-        X_2d = pca.fit_transform(X_sub)
-        for model_name, color in zip(model_list, colors):
-            mask = m_sub == model_name
-            ax.scatter(X_2d[mask, 0], X_2d[mask, 1], c=[color], label=model_name, alpha=0.4, s=8, linewidths=0)
-        ax.set_title(rep)
-        ax.set_xlabel("PC1")
-        ax.legend(markerscale=2, fontsize=7)
-    plt.suptitle("PCA of test set features — colored by model", y=1.02)
-    plt.tight_layout()
-    savefig(fig, plots_dir, "pca_by_model.png", save)
 
 
 def print_error_summary(reps, y_test, preds_dict, models):
@@ -232,10 +203,8 @@ def print_error_summary(reps, y_test, preds_dict, models):
         print(all_wrong["y_true"].value_counts().rename({0: "bonafide", 1: "spoof"}).to_string())
 
 
-
 # ---------------------------------------------------------------------------
 # Error analysis: acoustic profiling of misclassified samples
-# (ported from the experiments notebook)
 # ---------------------------------------------------------------------------
 def extract_acoustic_profile(audio, sr):
     """Per-utterance acoustic descriptors used to characterise hard samples."""
@@ -376,6 +345,7 @@ def plot_error_distributions(reps, acoustic_df, correct, universally_hard,
     n_feats = len(feat_cols)
 
     # Part A: per-representation grid (feature rows x representation columns)
+    # PNG: this grid has many thousands of histogram bars; PDF would be heavy.
     fig_a, axes_a = plt.subplots(n_feats, n_reps,
                                  figsize=(3.8 * n_reps, 3.2 * n_feats),
                                  squeeze=False)
@@ -396,7 +366,7 @@ def plot_error_distributions(reps, acoustic_df, correct, universally_hard,
                         "universally hard", axes_b[0], rsub_b, feat_cols)
     fig_b.suptitle("B) Universally hard (wrong by ALL reps) vs. rest", fontsize=11)
     plt.tight_layout()
-    savefig(fig_b, plots_dir, "error_dist_universal.png", save)
+    savefig(fig_b, plots_dir, "error_dist_universal.pdf", save)
 
 
 def fit_misclassification_lr(X_acoustic, y_hard, label, feat_cols):
@@ -467,7 +437,7 @@ def plot_lr_coefficients(reps, acoustic_df, correct, universally_hard,
     ax.set_title("LR coefficients: acoustic predictors of misclassification\n"
                  "(universally_hard = wrong by ALL reps)", fontsize=10)
     plt.tight_layout()
-    savefig(fig, plots_dir, "error_lr_coefs.png", save)
+    savefig(fig, plots_dir, "error_lr_coefs.pdf", save)
 
 
 def run_error_analysis(reps, y_test, preds_dict, features_dir, meta_dir,
@@ -492,6 +462,88 @@ def run_error_analysis(reps, y_test, preds_dict, features_dir, meta_dir,
                          ACOUSTIC_FEAT_COLS, plots_dir, save)
 
 
+# ---------------------------------------------------------------------------
+# DeLong test for the difference between two correlated ROC AUCs
+# (same test set, so the AUCs are not independent).
+# Implementation follows Sun & Xu (2014), "Fast Implementation of DeLong's
+# Algorithm for Comparing the Areas Under Correlated ROC Curves".
+# ---------------------------------------------------------------------------
+def _compute_midrank(x):
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    T2 = np.empty(N, dtype=float)
+    T2[J] = T
+    return T2
+
+
+def _fast_delong(predictions_sorted_transposed, label_1_count):
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
+    positive = predictions_sorted_transposed[:, :m]
+    negative = predictions_sorted_transposed[:, m:]
+    k = predictions_sorted_transposed.shape[0]
+
+    tx = np.empty([k, m], dtype=float)
+    ty = np.empty([k, n], dtype=float)
+    tz = np.empty([k, m + n], dtype=float)
+    for r in range(k):
+        tx[r, :] = _compute_midrank(positive[r, :])
+        ty[r, :] = _compute_midrank(negative[r, :])
+        tz[r, :] = _compute_midrank(predictions_sorted_transposed[r, :])
+    aucs = tz[:, :m].sum(axis=1) / m / n - (m + 1.0) / 2.0 / n
+    v01 = (tz[:, :m] - tx[:, :]) / n
+    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
+    sx = np.cov(v01)
+    sy = np.cov(v10)
+    delongcov = sx / m + sy / n
+    return aucs, delongcov
+
+
+def delong_roc_test(y_true, scores_a, scores_b):
+    """Return the two-sided p-value for AUC(a) == AUC(b) on the same labels."""
+    from scipy import stats
+
+    pos = y_true == 1
+    idx = np.concatenate([np.where(pos)[0], np.where(~pos)[0]])
+    label_1_count = int(np.sum(pos))
+    preds = np.vstack([scores_a[idx], scores_b[idx]])
+    aucs, cov = _fast_delong(preds, label_1_count)
+    l = np.array([[1, -1]])
+    var = l @ cov @ l.T
+    if var <= 0:
+        return float(aucs[0]), float(aucs[1]), 1.0
+    z = (aucs[0] - aucs[1]) / np.sqrt(var)
+    p = 2 * (1 - stats.norm.cdf(abs(z)))
+    return float(aucs[0]), float(aucs[1]), float(p[0][0] if np.ndim(p) else p)
+
+
+def auc_significance_matrix(reps, probs_dict, y_test, plots_dir, save):
+    """Pairwise DeLong p-values for all representation AUC differences."""
+    mat = pd.DataFrame(np.nan, index=reps, columns=reps)
+    for i, a in enumerate(reps):
+        for b in reps[i + 1:]:
+            _, _, pval = delong_roc_test(y_test, probs_dict[a], probs_dict[b])
+            mat.loc[a, b] = pval
+            mat.loc[b, a] = pval
+    print("\nPairwise DeLong AUC significance (p-values):")
+    print(mat.round(4).to_string())
+    if save:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        out = plots_dir / "auc_significance.csv"
+        mat.to_csv(out)
+        print(f"  saved \u2192 {out}")
+    return mat
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyse saved predictions and generate plots.")
     parser.add_argument(
@@ -499,7 +551,7 @@ def main():
         nargs="+",
         required=True,
         metavar="REP",
-        help="One or more feature representations, e.g. prosodic whisper xlsr",
+        help="One or more feature representations, e.g. prosodic whisper xlsr ensemble",
     )
     parser.add_argument(
         "--features-dir",
@@ -568,16 +620,17 @@ def main():
     print("Metrics:")
     print(df_results.round(4).to_string())
     print_error_summary(reps, y_test, preds_dict, models)
+
+    if len(reps) > 1:
+        auc_significance_matrix(reps, probs_dict, y_test, args.plots_dir, args.save_plots)
     print("Generating plots")
     plot_roc(reps, y_test, probs_dict, args.plots_dir, args.save_plots)
     plot_confusion_matrices(reps, y_test, preds_dict, args.plots_dir, args.save_plots)
-    plot_per_model_accuracy(reps, y_test, preds_dict, models, args.plots_dir, args.save_plots)
     plot_error_heatmap(reps, y_test, preds_dict, models, args.plots_dir, args.save_plots)
 
     if not args.skip_pca:
         X_test_dict = {rep: load_test_features(args.features_dir, rep) for rep in reps}
         plot_pca_by_label(reps, y_test, X_test_dict, args.plots_dir, args.save_plots)
-        plot_pca_by_model(reps, y_test, X_test_dict, models, args.plots_dir, args.save_plots)
 
     if args.error_analysis:
         run_error_analysis(reps, y_test, preds_dict, args.features_dir,

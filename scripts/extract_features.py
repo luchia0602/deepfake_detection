@@ -10,14 +10,14 @@ DATASET_ID = "AKCIT-Deepfake/BRSpeech-DF"
 
 
 def extract_split(loader, extractor, split_name: str, with_features: bool = True):
-    """Stream one split in CSV order.
+    """Stream one split in CSV order and build its feature array.
 
-    Returns (X, y). Labels are collected from the stream itself, so they stay
-    aligned with the feature rows by construction. When `with_features` is False
-    the extractor is not run (used when only y.npy needs to be (re)built).
+    Labels are written by SplitLoader itself (it saves <split>/y.npy once the
+    stream is fully consumed), so this function only builds X. When
+    `with_features` is False the stream is still consumed -- so the loader can
+    (re)write y.npy -- but the extractor is not run.
     """
     X = []
-    y = []
     n_examples = loader.stats(split_name)["total"]
     for audio, sr, label, meta in tqdm(
         loader.stream(split_name),
@@ -26,9 +26,7 @@ def extract_split(loader, extractor, split_name: str, with_features: bool = True
     ):
         if with_features:
             X.append(extractor(audio, sr))
-        y.append(label)
-    X_arr = np.array(X, dtype=np.float32) if with_features else None
-    return X_arr, np.array(y, dtype=np.int64)
+    return np.array(X, dtype=np.float32) if with_features else None
 
 
 def main():
@@ -58,6 +56,7 @@ def main():
     loader = SplitLoader(
         dataset_id=DATASET_ID,
         splits_dir=str(args.meta_dir),
+        features_dir=ARTIFACTS_DIR,
     )
     loader.print_stats()
 
@@ -69,26 +68,20 @@ def main():
         y_file = split_dir / "y.npy"
 
         need_x = args.force or not x_file.exists()
-        need_y = not y_file.exists()  # written once, shared across representations
+        need_y = not y_file.exists()
 
         if not need_x and not need_y:
             print(f"[{split}] X and y exist -> skipping")
             continue
 
+        # Consuming the stream makes SplitLoader (re)write y.npy in CSV order.
+        X = extract_split(loader, extractor, split, with_features=need_x)
+
         if need_x:
-            X, y = extract_split(loader, extractor, split, with_features=True)
             np.save(x_file, X)
             print(f"[{split}] saved {x_file.name} shape={X.shape}")
         else:
-            # X already present; stream labels only (no feature extraction)
-            _, y = extract_split(loader, extractor, split, with_features=False)
-            print(f"[{split}] {x_file.name} exists -> kept")
-
-        if need_y:
-            np.save(y_file, y)
-            print(f"[{split}] saved {y_file.name} shape={y.shape}")
-        else:
-            print(f"[{split}] {y_file.name} exists -> kept")
+            print(f"[{split}] {x_file.name} exists -> kept (refreshed y.npy)")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ class SplitLoader:
     dataset_id : str
         HuggingFace dataset repo, e.g. "AKCIT-Deepfake/BRSpeech-DF".
     splits_dir : str | Path
-        Directory containing train.csv, val.csv, test.csv.
+        Directory containing train.csv, test.csv.
     features_dir : str | Path | None
         Root directory where <split>/y.npy will be written.
         Defaults to <splits_dir>/features.
@@ -23,7 +23,7 @@ class SplitLoader:
         CSV column for the ground-truth label. Defaults to "label".
     """
 
-    _SPLIT_FILES = {"train": "train.csv", "val": "val.csv", "test": "test.csv"}
+    _SPLIT_FILES = {"train": "train.csv", "test": "test.csv"}
 
     def __init__(
         self,
@@ -49,9 +49,9 @@ class SplitLoader:
         if not self._meta:
             raise FileNotFoundError(
                 f"No split CSVs found in {self.splits_dir}. "
-                "Expected train.csv, val.csv, test.csv."
+                "Expected train.csv, test.csv."
             )
-          
+
     # Public API
 
     def stats(self, split: str) -> dict:
@@ -66,7 +66,7 @@ class SplitLoader:
     def print_stats(self) -> None:
         print(f"{'split':<8} {'total':>8} {'bonafide':>10} {'spoof':>8}")
         print("-" * 38)
-        for split in ("train", "val", "test"):
+        for split in ("train", "test"):
             if split in self._meta:
                 s = self.stats(split)
                 print(

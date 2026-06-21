@@ -9,14 +9,15 @@ Benchmarking audio deepfake detection features on Portuguese speech. Compares ha
 ## 1. Requirements
 
 ```bash
-pip install datasets librosa numpy pandas scikit-learn tqdm scipy \
-    python_speech_features amfm_decompy transformers torch
+pip install "datasets<4.0" librosa matplotlib numpy pandas scikit-learn scipy \
+    soundfile tqdm torch torchaudio transformers \
+    python_speech_features amfm_decompy
 ```
 
 The CQCC extractor also requires the ASVspoof 2021 baseline folder to be present at:
 
 ```text
-2021/LA/Baseline-CQCC-GMM/python/
+pipeline/2021/LA/Baseline-CQCC-GMM/python/
 ```
 
 relative to the project root (clone it from the ASVspoof 2021 repository separately).
@@ -36,6 +37,8 @@ evaluate.py
         ↓
 analyse.py
 ```
+
+Streaming of audio and labels from HuggingFace is handled by a shared helper, `scripts/loader.py`, whose `SplitLoader` class is used by both `extract_features.py` and `analyse.py` (the latter only for the optional acoustic error analysis). It reads the split CSVs, streams each native HuggingFace split once in order, and writes the shared `y.npy` label file per split.
 
 ---
 

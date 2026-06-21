@@ -44,26 +44,22 @@ analyse.py
 ### Command
 
 ```bash
-python scripts/prepare_splits.py [-h] [--dataset-id DATASET_ID]
-                                 [--output-dir OUTPUT_DIR]
-                                 [--train-ratio TRAIN_RATIO]
-                                 [--val-ratio VAL_RATIO]
-                                 [--seed SEED]
+python scripts/prepare_splits.py [-h] [--output-dir OUTPUT_DIR]
 ```
 
 ### Description
 
-Streams metadata from HuggingFace, builds balanced train / val / test splits (equal bonafide / spoof counts, spoof diversity-aware), and writes `train.csv`, `val.csv`, and `test.csv` to `--output-dir`.
+Streams bonafide and spoof metadata from HuggingFace and builds balanced splits. Within each of the dataset's native HuggingFace splits (train / validation / test), it keeps all bonafide examples and samples an equal, TTS-model-diverse set of spoof examples (slots are allocated across models proportionally to each model's count). It then merges the validation split into the test split, writing `train.csv` and `test.csv`.
+
+Because balancing happens within each original split, the result inherits the dataset's speaker-disjoint partition: no speaker appears in both train and test.
+
+The dataset ID and the random seed are fixed constants and are not configurable from the command line.
 
 ### Arguments
 
-| Argument        | Default                      | Description                                     |
-| --------------- | ---------------------------- | ----------------------------------------------- |
-| `--dataset-id`  | `AKCIT-Deepfake/BRSpeech-DF` | HuggingFace dataset repo ID                     |
-| `--output-dir`  | `artifacts/`                 | Where to write the three CSVs                   |
-| `--train-ratio` | `0.8`                        | Fraction of bonafide examples used for training |
-| `--val-ratio`   | `0.1`                        | Fraction used for validation                    |
-| `--seed`        | `42`                         | Random seed for reproducibility                 |
+| Argument       | Default      | Description                                |
+| -------------- | ------------ | ------------------------------------------ |
+| `--output-dir` | `artifacts/` | Where to write `train.csv` / `test.csv`    |
 
 ### Example
 
@@ -76,7 +72,6 @@ python scripts/prepare_splits.py
 ```text
 artifacts/
 ├── train.csv
-├── val.csv
 └── test.csv
 ```
 
@@ -89,27 +84,23 @@ artifacts/
 ```bash
 python scripts/extract_features.py [-h] \
     --representation {prosodic,whisper,xlsr,mfcc,lfcc,cqcc} \
-    [--features-dir FEATURES_DIR] \
-    [--dataset-id DATASET_ID] \
     [--meta-dir META_DIR] \
     [--force]
 ```
 
 ### Description
 
-Streams audio from HuggingFace for each split in the CSVs, runs the chosen extractor, and saves `X_<name>.npy` and `y.npy` arrays.
+Streams audio from HuggingFace for the train and test splits, runs the chosen extractor, and saves an `X_<name>.npy` feature array per split. Running it also produces a shared `y.npy` per split: the labels are written by the loader in CSV order and are the same for every representation.
 
-Run once per representation.
+Run once per representation. The dataset ID and the features output directory (`artifacts/features/`) are fixed constants and are not configurable from the command line.
 
 ### Arguments
 
-| Argument           | Default                      | Description                     |
-| ------------------ | ---------------------------- | ------------------------------- |
-| `--representation` | required                     | Feature type to extract         |
-| `--features-dir`   | `artifacts/features/`        | Where to write feature arrays   |
-| `--dataset-id`     | `AKCIT-Deepfake/BRSpeech-DF` | HuggingFace dataset repo ID     |
-| `--meta-dir`       | `artifacts/`                 | Directory containing split CSVs |
-| `--force`          | off                          | Overwrite existing files        |
+| Argument           | Default      | Description                     |
+| ------------------ | ------------ | ------------------------------- |
+| `--representation` | required     | Feature type to extract         |
+| `--meta-dir`       | `artifacts/` | Directory containing split CSVs |
+| `--force`          | off          | Overwrite existing feature files |
 
 ### Example (single representation)
 
@@ -128,14 +119,12 @@ done
 
 ### Output
 
+`y.npy` is shared across representations (written once per split, in CSV order).
+
 ```text
 artifacts/features/
 
 train/
-├── X_prosodic.npy
-└── y.npy
-
-val/
 ├── X_prosodic.npy
 └── y.npy
 
@@ -153,8 +142,8 @@ test/
 ```bash
 python scripts/evaluate.py [-h] \
     --representation REP [REP ...] \
+    [--ensemble-of REP [REP ...]] \
     [--features-dir FEATURES_DIR] \
-    [--meta-dir META_DIR] \
     [--force]
 ```
 
@@ -164,14 +153,16 @@ Trains a Logistic Regression classifier for each representation, evaluates it on
 
 Representations whose predictions already exist are skipped unless `--force` is specified.
 
+To train a single classifier on several representations at once, pass the name `ensemble` to `--representation` together with `--ensemble-of`; the listed feature sets are concatenated column-wise before training.
+
 ### Arguments
 
-| Argument           | Default               | Description                     |
-| ------------------ | --------------------- | ------------------------------- |
-| `--representation` | required              | One or more feature types       |
-| `--features-dir`   | `artifacts/features/` | Root features directory         |
-| `--meta-dir`       | `artifacts/`          | Directory containing split CSVs |
-| `--force`          | off                   | Overwrite existing predictions  |
+| Argument           | Default               | Description                                                          |
+| ------------------ | --------------------- | -------------------------------------------------------------------- |
+| `--representation` | required              | One or more feature types                                            |
+| `--ensemble-of`    | none                  | Representations to concatenate when `--representation` includes `ensemble` |
+| `--features-dir`   | `artifacts/features/` | Root features directory                                              |
+| `--force`          | off                   | Overwrite existing predictions                                       |
 
 ### Example (single representation)
 
@@ -184,6 +175,14 @@ python scripts/evaluate.py --representation prosodic
 ```bash
 python scripts/evaluate.py \
     --representation prosodic mfcc lfcc cqcc xlsr whisper
+```
+
+### Example (ensemble of concatenated representations)
+
+```bash
+python scripts/evaluate.py \
+    --representation ensemble \
+    --ensemble-of prosodic mfcc lfcc cqcc xlsr whisper
 ```
 
 ### Output
@@ -210,25 +209,27 @@ python scripts/analyse.py [-h] \
     [--meta-dir META_DIR] \
     [--save-plots] \
     [--plots-dir PLOTS_DIR] \
-    [--skip-pca]
+    [--skip-pca] \
+    [--error-analysis]
 ```
 
 ### Description
 
-Loads saved predictions, prints a metrics table and error analysis, and generates six plots.
+Loads saved predictions, prints a metrics table and error analysis, and generates four plots (plus additional acoustic error-analysis plots when `--error-analysis` is given).
 
 Requires `evaluate.py` to have been run first.
 
 ### Arguments
 
-| Argument           | Default               | Description                     |
-| ------------------ | --------------------- | ------------------------------- |
-| `--representation` | required              | One or more feature types       |
-| `--features-dir`   | `artifacts/features/` | Root features directory         |
-| `--meta-dir`       | `artifacts/`          | Directory containing `test.csv` |
-| `--save-plots`     | off                   | Save plots to disk              |
-| `--plots-dir`      | `results/plots/`      | Plot output directory           |
-| `--skip-pca`       | off                   | Skip PCA visualisations         |
+| Argument           | Default               | Description                                                                                                  |
+| ------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--representation` | required              | One or more feature types                                                                                    |
+| `--features-dir`   | `artifacts/features/` | Root features directory                                                                                      |
+| `--meta-dir`       | `artifacts/`          | Directory containing `test.csv`                                                                              |
+| `--save-plots`     | off                   | Save plots to disk                                                                                           |
+| `--plots-dir`      | `results/plots/`      | Plot output directory                                                                                        |
+| `--skip-pca`       | off                   | Skip PCA visualisations                                                                                      |
+| `--error-analysis` | off                   | Run acoustic error analysis (streams test audio once if not cached): MWU tests, distribution plots, misclassification-LR coefficient heatmap |
 
 ### Example (interactive)
 
@@ -254,16 +255,24 @@ python scripts/analyse.py \
     --skip-pca
 ```
 
-### Plots Produced
+### Output Produced
 
 ```text
 results/plots/
-├── roc_curves.png
-├── confusion_matrices.png
-├── per_model_accuracy.png
-├── error_heatmap.png
-├── pca_by_label.png
-└── pca_by_model.png
+├── roc_curves.pdf
+├── confusion_matrices.pdf
+├── error_heatmap.pdf
+├── pca_by_label.png          # skipped with --skip-pca
+└── auc_significance.csv      # only with multiple representations
+```
+
+With `--error-analysis`, additionally:
+
+```text
+results/plots/
+├── error_dist_per_rep.png
+├── error_dist_universal.pdf
+└── error_lr_coefs.pdf
 ```
 
 ---
